@@ -9,7 +9,7 @@
 - Установка зависимостей: `pip install -r requirements.txt`
 - Переменные окружения:
   - `TELEGRAM_BOT_TOKEN` — токен бота
-  - `DATABASE_URL` — строка подключения к PostgreSQL (`postgresql://user:pass@host:port/db`)
+  - `DATABASE_URL` — строка подключения к PostgreSQL (`postgresql://user:pass@host:port/db`). На Railway копируй именно `DATABASE_PUBLIC_URL`, потому что внутренний `postgres.railway.internal` недоступен из других сервисов.
   - `BOT_TIMEZONE` — (опционально) часовой пояс, по умолчанию `Asia/Almaty` (Астана)
 
 ## Возможности
@@ -20,6 +20,7 @@
 - Авто‑завершение сессии, если пользователь забыл нажать стоп перед новым стартом
 - Подсчёт времени только в рамках текущей недели (пон-Вс) + подробный список сессий недели в статистике
 - Отдельная кнопка «Текущая сессия» показывает сколько длится активный таймер
+- Ручное управление: `/add_session`, `/edit_session`, `/delete_session` для внесения правок
 
 ## Запуск
 
@@ -28,6 +29,14 @@ export TELEGRAM_BOT_TOKEN=...
 export DATABASE_URL=postgresql://...
 python bot.py
 ```
+
+## Команды управления
+
+- `/add_session 2024-05-18 09:00 2024-05-18 11:00` — добавить сессию вручную (формат `YYYY-MM-DD HH:MM`)
+- `/edit_session 42 2024-05-18 10:00 2024-05-18 12:30` — правка существующей сессии по ID
+- `/delete_session 42` — удалить сессию по ID
+
+ID отображаются в `/stats` (строки вида `1. #42 ...`).
 
 ### Railway шпаргалка
 

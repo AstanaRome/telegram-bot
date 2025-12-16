@@ -21,6 +21,7 @@ BUTTON_STATS = "📊 Статистика недели"
 BUTTON_CURRENT = "⏱ Текущая сессия"
 
 TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Asia/Almaty"))
+DATETIME_FORMAT = "%Y-%m-%d %H:%M"
 
 POOL: Optional[ConnectionPool] = None
 
@@ -51,6 +52,17 @@ def format_duration(seconds: float) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{secs:02}"
+
+
+def parse_user_datetime(raw: str) -> datetime:
+    try:
+        naive = datetime.strptime(raw, DATETIME_FORMAT)
+    except ValueError as exc:
+        raise ValueError(
+            f"Не удалось распознать дату '{raw}'. "
+            f"Используй формат YYYY-MM-DD HH:MM (например, 2024-05-18 09:00)."
+        ) from exc
+    return naive.replace(tzinfo=TIMEZONE)
 
 
 def init_db(pool: ConnectionPool) -> None:
@@ -133,15 +145,67 @@ def close_session(session_id: int, finished_at: datetime) -> None:
         conn.commit()
 
 
-def fetch_week_sessions(
-    user_id: int, week_start: datetime, week_end: datetime
-) -> List[Tuple[datetime, Optional[datetime]]]:
+def insert_manual_session(user_id: int, start_at: datetime, end_at: datetime) -> int:
     pool = get_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT start_at, end_at
+                INSERT INTO sessions (user_id, start_at, end_at)
+                VALUES (%s, %s, %s)
+                RETURNING id;
+                """,
+                (user_id, start_at, end_at),
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return new_id
+
+
+def update_session_times(
+    session_id: int, user_id: int, start_at: datetime, end_at: datetime
+) -> bool:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE sessions
+                SET start_at = %s, end_at = %s
+                WHERE id = %s AND user_id = %s;
+                """,
+                (start_at, end_at, session_id, user_id),
+            )
+            updated = cur.rowcount > 0
+        conn.commit()
+    return updated
+
+
+def delete_session_record(session_id: int, user_id: int) -> bool:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM sessions
+                WHERE id = %s AND user_id = %s;
+                """,
+                (session_id, user_id),
+            )
+            deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
+def fetch_week_sessions(
+    user_id: int, week_start: datetime, week_end: datetime
+) -> List[Tuple[int, datetime, Optional[datetime]]]:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, start_at, end_at
                 FROM sessions
                 WHERE user_id = %s
                   AND start_at >= %s
@@ -151,7 +215,7 @@ def fetch_week_sessions(
                 (user_id, week_start, week_end),
             )
             rows = cur.fetchall()
-    return [(row[0], row[1]) for row in rows]
+    return [(row[0], row[1], row[2]) for row in rows]
 
 
 def calc_week_summary(
@@ -162,7 +226,7 @@ def calc_week_summary(
     total_seconds = 0.0
     detail_lines: List[str] = []
 
-    for idx, (start_at, end_at) in enumerate(sessions, start=1):
+    for idx, (session_id, start_at, end_at) in enumerate(sessions, start=1):
         start_local = start_at.astimezone(TIMEZONE)
         end_local = end_at.astimezone(TIMEZONE) if end_at else now
         effective_end_local = min(end_local, week_end)
@@ -172,12 +236,12 @@ def calc_week_summary(
         total_seconds += duration_seconds
         if end_at:
             detail_lines.append(
-                f"{idx}. {format_dt(start_at)} – {format_dt(end_at)} "
+                f"{idx}. #{session_id} {format_dt(start_at)} – {format_dt(end_at)} "
                 f"({format_duration(duration_seconds)})"
             )
         else:
             detail_lines.append(
-                f"{idx}. {format_dt(start_at)} – … "
+                f"{idx}. #{session_id} {format_dt(start_at)} – … "
                 f"(идёт, {format_duration(duration_seconds)})"
             )
 
@@ -319,6 +383,125 @@ async def handle_current_session(update: Update) -> None:
     )
 
 
+def _expect_args(message: str) -> str:
+    return (
+        f"{message}\nФормат: YYYY-MM-DD HH:MM. Пример: 2024-05-18 09:00."
+    )
+
+
+async def cmd_add_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    args = context.args
+    if len(args) < 4:
+        await update.message.reply_text(
+            _expect_args(
+                "Нужно указать начало и конец: /add_session 2024-05-18 09:00 2024-05-18 11:00"
+            )
+        )
+        return
+
+    start_raw = " ".join(args[:2])
+    end_raw = " ".join(args[2:4])
+    try:
+        start_at = parse_user_datetime(start_raw)
+        end_at = parse_user_datetime(end_raw)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    if end_at <= start_at:
+        await update.message.reply_text("Время окончания должно быть позже начала.")
+        return
+
+    new_id = insert_manual_session(user.id, start_at, end_at)
+    await update.message.reply_text(
+        "Сессия добавлена вручную.\n"
+        f"ID #{new_id}\n"
+        f"Начало: {format_dt(start_at)}\n"
+        f"Конец: {format_dt(end_at)}\n"
+        f"Длительность: {format_duration((end_at - start_at).total_seconds())}"
+    )
+
+
+async def cmd_edit_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    args = context.args
+    if len(args) < 5:
+        await update.message.reply_text(
+            _expect_args(
+                "Нужно указать id, новое начало и конец: "
+                "/edit_session 123 2024-05-18 09:00 2024-05-18 11:30"
+            )
+        )
+        return
+
+    try:
+        session_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    start_raw = " ".join(args[1:3])
+    end_raw = " ".join(args[3:5])
+    try:
+        start_at = parse_user_datetime(start_raw)
+        end_at = parse_user_datetime(end_raw)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    if end_at <= start_at:
+        await update.message.reply_text("Время окончания должно быть позже начала.")
+        return
+
+    updated = update_session_times(session_id, user.id, start_at, end_at)
+    if not updated:
+        await update.message.reply_text(
+            "Сессия не найдена. Проверь ID (его можно посмотреть в /stats)."
+        )
+        return
+
+    await update.message.reply_text(
+        "Сессия обновлена.\n"
+        f"ID #{session_id}\n"
+        f"Начало: {format_dt(start_at)}\n"
+        f"Конец: {format_dt(end_at)}"
+    )
+
+
+async def cmd_delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Укажи ID: /delete_session 123. "
+            "ID можно посмотреть в /stats."
+        )
+        return
+
+    try:
+        session_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    deleted = delete_session_record(session_id, user.id)
+    if not deleted:
+        await update.message.reply_text(
+            "Сессия не найдена или уже удалена."
+        )
+        return
+
+    await update.message.reply_text(f"Сессия #{session_id} удалена.")
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -336,6 +519,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("stats", handle_stats))
+    app.add_handler(CommandHandler("add_session", cmd_add_session))
+    app.add_handler(CommandHandler("edit_session", cmd_edit_session))
+    app.add_handler(CommandHandler("delete_session", cmd_delete_session))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
     app.run_polling()
