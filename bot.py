@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -336,7 +337,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         flow = start_flow(context, "delete")
         flow["step"] = "id"
         await update.message.reply_text(
-            "Введи ID сессии, которую нужно удалить (смотри /stats).",
+            "Введи ID сессии, которую нужно удалить (можно несколько через запятую, смотри /stats).",
         )
     else:
         await update.message.reply_text(
@@ -545,25 +546,62 @@ async def cmd_delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Укажи ID: /delete_session 123. "
+            "Укажи ID: /delete_session 123 или /delete_session 12,15,18. "
             "ID можно посмотреть в /stats."
         )
         return
 
+    raw_ids = " ".join(args)
     try:
-        session_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("ID должен быть числом.")
+        session_ids = parse_id_list(raw_ids)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
         return
 
-    deleted = delete_session_record(session_id, user.id)
-    if not deleted:
-        await update.message.reply_text(
-            "Сессия не найдена или уже удалена."
+    deleted_ids: List[int] = []
+    missing_ids: List[int] = []
+    for session_id in session_ids:
+        if delete_session_record(session_id, user.id):
+            deleted_ids.append(session_id)
+        else:
+            missing_ids.append(session_id)
+
+    parts = []
+    if deleted_ids:
+        parts.append(
+            "Удалены: " + ", ".join(f"#{sid}" for sid in deleted_ids)
         )
-        return
+    if missing_ids:
+        parts.append(
+            "Не найдены: " + ", ".join(f"#{sid}" for sid in missing_ids)
+        )
+    if not parts:
+        parts.append("Ничего не удалено.")
 
-    await update.message.reply_text(f"Сессия #{session_id} удалена.")
+    await update.message.reply_text(
+        "\n".join(parts),
+        reply_markup=build_keyboard(),
+    )
+
+
+def parse_id_list(raw: str) -> List[int]:
+    tokens = [token for token in re.split(r"[,\s]+", raw.strip()) if token]
+    if not tokens:
+        raise ValueError("Не указаны ID.")
+    ids: List[int] = []
+    for token in tokens:
+        try:
+            ids.append(int(token))
+        except ValueError as exc:
+            raise ValueError("ID должны быть числами, например: 12,15,18") from exc
+    # сохраняем порядок, удаляем дубликаты
+    seen = set()
+    ordered_ids: List[int] = []
+    for value in ids:
+        if value not in seen:
+            seen.add(value)
+            ordered_ids.append(value)
+    return ordered_ids
 
 
 async def process_add_flow(
@@ -698,20 +736,30 @@ async def process_delete_flow(
         )
         return
     try:
-        session_id = int(text)
-    except ValueError:
-        await update.message.reply_text("ID должен быть числом.")
+        session_ids = parse_id_list(text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
         return
-    deleted = delete_session_record(session_id, update.effective_user.id)
+
+    deleted_ids: List[int] = []
+    missing_ids: List[int] = []
+    for session_id in session_ids:
+        if delete_session_record(session_id, update.effective_user.id):
+            deleted_ids.append(session_id)
+        else:
+            missing_ids.append(session_id)
+
     reset_flow(context)
-    if not deleted:
-        await update.message.reply_text(
-            "Сессия не найдена или уже удалена.",
-            reply_markup=build_keyboard(),
-        )
-        return
+    parts = []
+    if deleted_ids:
+        parts.append("Удалены: " + ", ".join(f"#{sid}" for sid in deleted_ids))
+    if missing_ids:
+        parts.append("Не найдены: " + ", ".join(f"#{sid}" for sid in missing_ids))
+    if not parts:
+        parts.append("Ничего не удалено.")
+
     await update.message.reply_text(
-        f"Сессия #{session_id} удалена.",
+        "\n".join(parts),
         reply_markup=build_keyboard(),
     )
 
