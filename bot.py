@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
@@ -19,6 +19,10 @@ BUTTON_START = "▶️ Начать сессию"
 BUTTON_STOP = "⏹ Закончить сессию"
 BUTTON_STATS = "📊 Статистика недели"
 BUTTON_CURRENT = "⏱ Текущая сессия"
+BUTTON_ADD = "➕ Добавить вручную"
+BUTTON_EDIT = "✏️ Редактировать"
+BUTTON_DELETE = "🗑 Удалить"
+BUTTON_CANCEL = "❌ Отмена"
 
 TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Asia/Almaty"))
 DATETIME_FORMAT = "%Y-%m-%d %H:%M"
@@ -250,7 +254,12 @@ def calc_week_summary(
 
 def build_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_START, BUTTON_STOP], [BUTTON_STATS, BUTTON_CURRENT]],
+        [
+            [BUTTON_START, BUTTON_STOP],
+            [BUTTON_STATS, BUTTON_CURRENT],
+            [BUTTON_ADD, BUTTON_EDIT, BUTTON_DELETE],
+            [BUTTON_CANCEL],
+        ],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -264,8 +273,45 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def reset_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("flow", None)
+
+
+def start_flow(context: ContextTypes.DEFAULT_TYPE, flow_type: str) -> Dict[str, Any]:
+    flow: Dict[str, Any] = {"type": flow_type, "step": "init", "data": {}}
+    context.user_data["flow"] = flow
+    return flow
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
+    flow = context.user_data.get("flow")
+    cancel_triggered = text.lower() == "отмена" or text == BUTTON_CANCEL
+
+    if flow:
+        if cancel_triggered:
+            reset_flow(context)
+            await update.message.reply_text(
+                "Ввод отменён.", reply_markup=build_keyboard()
+            )
+            return
+        flow_type = flow.get("type")
+        if flow_type == "add":
+            await process_add_flow(update, context, text)
+            return
+        if flow_type == "edit":
+            await process_edit_flow(update, context, text)
+            return
+        if flow_type == "delete":
+            await process_delete_flow(update, context, text)
+            return
+
+    if cancel_triggered:
+        await update.message.reply_text(
+            "Нет активного ввода, нечего отменять.", reply_markup=build_keyboard()
+        )
+        return
+
     if text == BUTTON_START:
         await handle_start_session(update)
     elif text == BUTTON_STOP:
@@ -274,9 +320,27 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await handle_stats(update)
     elif text == BUTTON_CURRENT:
         await handle_current_session(update)
+    elif text == BUTTON_ADD:
+        flow = start_flow(context, "add")
+        flow["step"] = "start"
+        await update.message.reply_text(
+            "Введи начало новой сессии (формат YYYY-MM-DD HH:MM).",
+        )
+    elif text == BUTTON_EDIT:
+        flow = start_flow(context, "edit")
+        flow["step"] = "id"
+        await update.message.reply_text(
+            "Введи ID сессии, которую нужно отредактировать (смотри /stats).",
+        )
+    elif text == BUTTON_DELETE:
+        flow = start_flow(context, "delete")
+        flow["step"] = "id"
+        await update.message.reply_text(
+            "Введи ID сессии, которую нужно удалить (смотри /stats).",
+        )
     else:
         await update.message.reply_text(
-            "Используй кнопки на клавиатуре.",
+            "Используй кнопки или команды /add_session, /edit_session, /delete_session.",
             reply_markup=build_keyboard(),
         )
 
@@ -502,6 +566,156 @@ async def cmd_delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"Сессия #{session_id} удалена.")
 
 
+async def process_add_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    flow = context.user_data["flow"]
+    step = flow.get("step")
+    data = flow.setdefault("data", {})
+
+    if step == "start":
+        try:
+            start_at = parse_user_datetime(text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        data["start"] = start_at
+        flow["step"] = "end"
+        await update.message.reply_text(
+            "Начало записал. Теперь введи конец (YYYY-MM-DD HH:MM)."
+        )
+        return
+
+    if step == "end":
+        start_at: datetime = data.get("start")
+        try:
+            end_at = parse_user_datetime(text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if not start_at:
+            reset_flow(context)
+            await update.message.reply_text(
+                "Что-то пошло не так. Попробуй начать снова.", reply_markup=build_keyboard()
+            )
+            return
+        if end_at <= start_at:
+            await update.message.reply_text("Время окончания должно быть позже начала.")
+            return
+        new_id = insert_manual_session(update.effective_user.id, start_at, end_at)
+        reset_flow(context)
+        await update.message.reply_text(
+            "Сессия добавлена вручную.\n"
+            f"ID #{new_id}\n"
+            f"Начало: {format_dt(start_at)}\n"
+            f"Конец: {format_dt(end_at)}\n"
+            f"Длительность: {format_duration((end_at - start_at).total_seconds())}",
+            reply_markup=build_keyboard(),
+        )
+        return
+
+
+async def process_edit_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    flow = context.user_data["flow"]
+    step = flow.get("step")
+    data = flow.setdefault("data", {})
+
+    if step == "id":
+        try:
+            session_id = int(text)
+        except ValueError:
+            await update.message.reply_text("ID должен быть числом.")
+            return
+        data["id"] = session_id
+        flow["step"] = "start"
+        await update.message.reply_text(
+            "Введи новое время начала (YYYY-MM-DD HH:MM)."
+        )
+        return
+
+    if step == "start":
+        try:
+            start_at = parse_user_datetime(text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        data["start"] = start_at
+        flow["step"] = "end"
+        await update.message.reply_text(
+            "Начало записал. Теперь введи новое время окончания."
+        )
+        return
+
+    if step == "end":
+        try:
+            end_at = parse_user_datetime(text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        start_at: Optional[datetime] = data.get("start")
+        session_id: Optional[int] = data.get("id")
+        if start_at is None or session_id is None:
+            reset_flow(context)
+            await update.message.reply_text(
+                "Что-то пошло не так. Попробуй начать снова.", reply_markup=build_keyboard()
+            )
+            return
+        if end_at <= start_at:
+            await update.message.reply_text("Время окончания должно быть позже начала.")
+            return
+        updated = update_session_times(
+            session_id, update.effective_user.id, start_at, end_at
+        )
+        reset_flow(context)
+        if not updated:
+            await update.message.reply_text(
+                "Сессия не найдена. Проверь ID в /stats.",
+                reply_markup=build_keyboard(),
+            )
+            return
+        await update.message.reply_text(
+            "Сессия обновлена.\n"
+            f"ID #{session_id}\n"
+            f"Начало: {format_dt(start_at)}\n"
+            f"Конец: {format_dt(end_at)}",
+            reply_markup=build_keyboard(),
+        )
+        return
+
+
+async def process_delete_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    flow = context.user_data["flow"]
+    step = flow.get("step")
+    if step != "id":
+        reset_flow(context)
+        await update.message.reply_text(
+            "Что-то пошло не так. Попробуй снова удалить через кнопку.",
+            reply_markup=build_keyboard(),
+        )
+        return
+    try:
+        session_id = int(text)
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    deleted = delete_session_record(session_id, update.effective_user.id)
+    reset_flow(context)
+    if not deleted:
+        await update.message.reply_text(
+            "Сессия не найдена или уже удалена.",
+            reply_markup=build_keyboard(),
+        )
+        return
+    await update.message.reply_text(
+        f"Сессия #{session_id} удалена.",
+        reply_markup=build_keyboard(),
+    )
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -522,7 +736,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add_session", cmd_add_session))
     app.add_handler(CommandHandler("edit_session", cmd_edit_session))
     app.add_handler(CommandHandler("delete_session", cmd_delete_session))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_polling()
 
